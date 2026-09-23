@@ -7,6 +7,7 @@ Sheet layout expected on every product tab:
 import asyncio
 import base64
 import difflib
+import html
 import json
 import logging
 import os
@@ -17,7 +18,10 @@ from functools import wraps
 
 import gspread
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, Update,
+)
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, filters,
@@ -99,26 +103,39 @@ def remove_item(tab, n):
     get_ws(tab).update(range_name=f"B{FIRST_ROW}:F{LAST_ROW}", values=rows, value_input_option="RAW")
 
 
-def get_categories():
-    """Categories actually in use, taken from every tab's own product data (column D),
-    so the list always matches the real sheet instead of a separately maintained one.
-    Falls back to the Lists tab (if any) for categories not yet used on a product."""
+def get_categories(tab=None):
+    """Categories actually in use, taken from product data (column D) so the list always
+    matches the real sheet instead of a separately maintained one. tab=None scans every
+    tab; a specific tab scans just that one. Falls back to the Lists tab (if any) for
+    categories not yet used on any product."""
     seen, cats = set(), []
-    for tab in TABS:
-        for _, row in list_items(tab):
+    for t in ([tab] if tab else TABS):
+        for _, row in list_items(t):
             cat = str(row[2]).strip()
             if cat and cat not in seen:
                 seen.add(cat)
                 cats.append(cat)
-    try:
-        for v in book.worksheet("Lists").col_values(1)[1:31]:
-            v = v.strip()
-            if v and v not in seen:
-                seen.add(v)
-                cats.append(v)
-    except gspread.exceptions.WorksheetNotFound:
-        pass
+    if not tab:
+        try:
+            for v in book.worksheet("Lists").col_values(1)[1:31]:
+                v = v.strip()
+                if v and v not in seen:
+                    seen.add(v)
+                    cats.append(v)
+        except gspread.exceptions.WorksheetNotFound:
+            pass
     return cats
+
+
+def page_items(tab, category, page, page_size=6):
+    """One page of in-stock-and-out-of-stock items in `tab` matching `category` exactly.
+    Returns (page_rows, total_pages) where page_rows is [(n, row), ...]."""
+    want = "" if category == "(no category)" else category
+    matches = [(n, row) for n, row in list_items(tab) if str(row[2]).strip() == want]
+    total_pages = max(1, (len(matches) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    return matches[start:start + page_size], total_pages, page
 
 
 MAX_RESULTS = 8
@@ -176,6 +193,18 @@ def fmt_item(n, row):
     return out + (f"\n   {details}" if str(details).strip() else "")
 
 
+def fmt_item_html(n, row):
+    """Same content as fmt_item, styled with HTML for the browse view (bold name, price)."""
+    name, price, cat, status, details = row
+    icon, word = ("✅", "In Stock") if status == "In Stock" else ("❌", "Out of Stock") if status else ("•", status)
+    out = f"<b>{n}. {html.escape(str(name))}</b>\n💰 <b>{html.escape(fmt_price(price))}</b>  ·  {icon} {word}"
+    return out + (f"\n📝 {html.escape(str(details))}" if str(details).strip() else "")
+
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [["📋 Browse", "🔍 Find"], ["➕ Add", "❓ Help"]], resize_keyboard=True)
+
+
 def cur_tab(context):
     return context.user_data.get("tab", TABS[0])
 
@@ -214,6 +243,8 @@ def admin_only(func):
 # ───────────────────────── simple commands ─────────────────────────
 HELP = (
     "Product catalog bot\n\n"
+    "Use the menu buttons below, or these commands:\n\n"
+    "/browse - browse products by tab and category\n"
     "/find <name> - search all tabs, with quick edit / stock / delete buttons\n"
     "/list - show products in the current tab\n"
     "/add - add a product (guided)\n"
@@ -228,7 +259,31 @@ HELP = (
 
 @admin_only
 async def start(update, context):
-    await update.message.reply_text(HELP)
+    await update.message.reply_text(HELP, reply_markup=MAIN_MENU)
+
+
+@admin_only
+async def find_prompt(update, context):
+    context.user_data["awaiting_find"] = True
+    await update.message.reply_text("What are you looking for? Type a product name.")
+
+
+@admin_only
+async def menu_text_router(update, context):
+    """Handles taps on the persistent menu buttons, and a pending /find prompt."""
+    text = update.message.text
+    if context.user_data.pop("awaiting_find", False):
+        context.args = text.split()
+        await find_cmd(update, context)
+        return
+    if text == "📋 Browse":
+        await browse_cmd(update, context)
+    elif text == "🔍 Find":
+        await find_prompt(update, context)
+    elif text == "➕ Add":
+        await add_start(update, context)
+    elif text == "❓ Help":
+        await update.message.reply_text(HELP, reply_markup=MAIN_MENU)
 
 
 async def myid(update, context):
@@ -247,6 +302,86 @@ async def tab_chosen(update, context):
     await q.answer()
     context.user_data["tab"] = TABS[int(q.data.split(":")[1])]
     await q.edit_message_text(f"Now working on: {context.user_data['tab']}")
+
+
+# ───────────────────────── /browse (tab -> category -> paged results) ─────────────────────────
+def page_kb(ti, ci, page, total_pages):
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("◀ Prev", callback_data=f"bp:{ti}:{ci}:{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("Next ▶", callback_data=f"bp:{ti}:{ci}:{page + 1}"))
+    back = InlineKeyboardButton("⬅ Categories", callback_data=f"bt:{ti}")
+    return InlineKeyboardMarkup([row, [back]])
+
+
+@admin_only
+async def browse_cmd(update, context):
+    await update.effective_message.reply_text("Browse - choose a tab:", reply_markup=keyboard(TABS, "bt", 1))
+
+
+@admin_only
+async def browse_tab(update, context):
+    q = update.callback_query
+    await q.answer()
+    ti = int(q.data.split(":")[1])
+    tab = TABS[ti]
+    items = await asyncio.to_thread(list_items, tab)
+    if not items:
+        await q.edit_message_text(f"'{tab}' has no products yet.")
+        return
+    counts = {}
+    cats = []
+    for _, row in items:
+        c = str(row[2]).strip() or "(no category)"
+        if c not in counts:
+            counts[c] = 0
+            cats.append(c)
+        counts[c] += 1
+    context.user_data["browse_cats"] = cats
+    labels = [f"{c} ({counts[c]})" for c in cats]
+    kb = keyboard(labels, f"bc:{ti}", 1)
+    await q.edit_message_text(f"[{tab}] Choose a category:", reply_markup=kb)
+
+
+@admin_only
+async def browse_category(update, context):
+    q = update.callback_query
+    await q.answer()
+    _, ti_ci = q.data.split(":", 1)
+    ti_s, ci_s = ti_ci.split(":")
+    ti, ci = int(ti_s), int(ci_s)
+    await _send_browse_page(q, context, ti, ci, 0)
+
+
+@admin_only
+async def browse_page(update, context):
+    q = update.callback_query
+    await q.answer()
+    _, ti, ci, page = q.data.split(":")
+    await _send_browse_page(q, context, int(ti), int(ci), int(page))
+
+
+async def _send_browse_page(q, context, ti, ci, page):
+    tab = TABS[ti]
+    cats = context.user_data.get("browse_cats") or await asyncio.to_thread(get_categories, tab)
+    if ci >= len(cats):
+        await q.edit_message_text("That category list changed - run /browse again.")
+        return
+    category = cats[ci]
+    rows, total_pages, page = await asyncio.to_thread(page_items, tab, category, page)
+    if not rows:
+        await q.edit_message_text(f"[{tab}] {category}\n\nNo products in this category.")
+        return
+    body = "\n\n".join(fmt_item_html(n, r) for n, r in rows)
+    text = f"<b>[{tab}] {html.escape(category)}</b>\n\n{body}"
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=page_kb(ti, ci, page, total_pages))
+
+
+@admin_only
+async def noop_cb(update, context):
+    await update.callback_query.answer()
 
 
 @admin_only
@@ -545,6 +680,7 @@ async def post_init(app):
         BotCommand("edit", "Edit a product"), BotCommand("stock", "Toggle stock status"),
         BotCommand("remove", "Delete a product"), BotCommand("tab", "Switch sheet tab"),
         BotCommand("cancel", "Cancel current action"), BotCommand("myid", "Show my Telegram ID"),
+        BotCommand("browse", "Browse products by tab and category"),
     ])
 
 
@@ -574,6 +710,7 @@ def main():
         entry_points=[
             CommandHandler("add", add_start),
             CommandHandler("edit", edit_start),
+            MessageHandler(filters.Regex(r"^➕ Add$"), add_start),
             CallbackQueryHandler(find_edit, pattern=r"^fe:\d+:\d+:[0-9a-f]+$"),
         ],
         states={
@@ -593,6 +730,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("browse", browse_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("stock", stock_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
@@ -601,6 +739,11 @@ def main():
     app.add_handler(CallbackQueryHandler(find_stock, pattern=r"^fs:\d+:\d+:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(find_delete, pattern=r"^fd:\d+:\d+:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(remove_choice, pattern=r"^rm:(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(browse_tab, pattern=r"^bt:\d+$"))
+    app.add_handler(CallbackQueryHandler(browse_category, pattern=r"^bc:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(browse_page, pattern=r"^bp:\d+:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
+    app.add_handler(MessageHandler(TXT, menu_text_router))
     app.add_error_handler(on_error)
     log.info("Bot started.")
     app.run_polling()
