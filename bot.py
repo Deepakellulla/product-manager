@@ -127,6 +127,22 @@ def get_categories(tab=None):
     return cats
 
 
+def get_details_options(tab, limit=8):
+    """The most-used Details/Delivery strings already in `tab`, most common first,
+    so adding a product can reuse one instead of retyping it."""
+    counts, order = {}, []
+    for _, row in list_items(tab):
+        d = str(row[4]).strip()
+        if not d:
+            continue
+        if d not in counts:
+            counts[d] = 0
+            order.append(d)
+        counts[d] += 1
+    order.sort(key=lambda d: -counts[d])
+    return order[:limit]
+
+
 def page_items(tab, category, page, page_size=6):
     """One page of in-stock-and-out-of-stock items in `tab` matching `category` exactly.
     Returns (page_rows, total_pages) where page_rows is [(n, row), ...]."""
@@ -573,7 +589,25 @@ async def add_status(update, context):
     await q.answer()
     status = STATUSES[int(q.data.split(":")[1])]
     context.user_data["new"]["status"] = status
-    await q.edit_message_text(f"Status: {status}\n\nDetails / delivery info? (or send /skip)")
+    opts = await asyncio.to_thread(get_details_options, cur_tab(context))
+    context.user_data["detail_opts"] = opts
+    if opts:
+        kb = keyboard(opts + ["✏️ Type my own"], "dd", 1)
+        await q.edit_message_text(f"Status: {status}\n\nDetails / delivery info - pick one, or add a new one:",
+                                   reply_markup=kb)
+    else:
+        await q.edit_message_text(f"Status: {status}\n\nDetails / delivery info? (or send /skip)")
+    return DETAILS
+
+
+async def add_details_choice(update, context):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":")[1])
+    opts = context.user_data.get("detail_opts", [])
+    if idx < len(opts):
+        return await _save_new(update, context, opts[idx])
+    await q.edit_message_text("Type the details / delivery info:")
     return DETAILS
 
 
@@ -584,9 +618,9 @@ async def _save_new(update, context, details):
     try:
         n = await asyncio.to_thread(add_item, tab, row)
     except RuntimeError as e:
-        await update.message.reply_text(str(e))
+        await update.effective_message.reply_text(str(e))
         return ConversationHandler.END
-    await update.message.reply_text(f"Added to '{tab}':\n\n{fmt_item(n, row)}")
+    await update.effective_message.reply_text(f"Added to '{tab}':\n\n{fmt_item(n, row)}")
     return ConversationHandler.END
 
 
@@ -626,6 +660,15 @@ async def edit_field(update, context):
     await q.answer()
     idx = int(q.data.split(":")[1])
     context.user_data["edit_idx"] = idx
+    if idx == 4:
+        opts = await asyncio.to_thread(get_details_options, context.user_data["edit_tab"])
+        context.user_data["choices"] = opts
+        if opts:
+            kb = keyboard(opts + ["✏️ Type my own"], "ev")
+            await q.edit_message_text("Choose the new details, or add a new one:", reply_markup=kb)
+            return EDIT_CHOICE
+        await q.edit_message_text("Send the new details:")
+        return EDIT_VALUE
     if idx in (2, 3):
         choices = await asyncio.to_thread(get_categories) if idx == 2 else STATUSES
         context.user_data["choices"] = choices
@@ -646,8 +689,12 @@ async def _save_edit(update, context, value):
 async def edit_choice(update, context):
     q = update.callback_query
     await q.answer()
-    value = context.user_data["choices"][int(q.data.split(":")[1])]
-    return await _save_edit(update, context, value)
+    choices = context.user_data["choices"]
+    idx = int(q.data.split(":")[1])
+    if idx >= len(choices):  # the appended "Type my own" option
+        await q.edit_message_text("Send the new value:")
+        return EDIT_VALUE
+    return await _save_edit(update, context, choices[idx])
 
 
 async def edit_value(update, context):
@@ -718,7 +765,8 @@ def main():
             PRICE: [MessageHandler(TXT, add_price)],
             CATEGORY: [CallbackQueryHandler(add_category, pattern=r"^cat:\d+$")],
             STATUS: [CallbackQueryHandler(add_status, pattern=r"^stat:\d+$")],
-            DETAILS: [CommandHandler("skip", add_skip), MessageHandler(TXT, add_details)],
+            DETAILS: [CommandHandler("skip", add_skip), CallbackQueryHandler(add_details_choice, pattern=r"^dd:\d+$"),
+                      MessageHandler(TXT, add_details)],
             EDIT_FIELD: [CallbackQueryHandler(edit_field, pattern=r"^ef:\d$")],
             EDIT_CHOICE: [CallbackQueryHandler(edit_choice, pattern=r"^ev:\d+$")],
             EDIT_VALUE: [MessageHandler(TXT, edit_value)],
