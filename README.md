@@ -40,8 +40,8 @@ python bot.py
 First run: leave `ADMIN_IDS` empty, start the bot, send `/myid` to it, put that number in `.env`, restart.
 
 ### 5. Keep it running 24/7
-The bot only works while `bot.py` is running. Test on your own PC first; for always-on use, run it on a
-small VPS or a hosting service that supports long-running Python processes.
+The bot only works while `bot.py` is running. Test on your own PC first; for always-on use, see
+`DEPLOY_RAILWAY.md` for step-by-step deployment on Railway.
 
 ## Notes
 - Only Telegram IDs listed in `ADMIN_IDS` can use the bot.
