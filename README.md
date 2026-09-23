@@ -5,7 +5,8 @@ Works with the "Product Catalog Template" layout (products start at row 5, colum
 
 ## Menu
 `/start` shows a persistent menu with **📋 Browse**, **🔍 Find**, **➕ Add** and **❓ Help** buttons,
-so day-to-day use rarely needs typing a command.
+so day-to-day use rarely needs typing a command. When adding or editing a product, Details/Delivery
+also offers your 8 most-used values as buttons, plus a "✏️ Type my own" option for anything new.
 
 ## Commands
 | Command | What it does |
