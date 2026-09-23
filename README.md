@@ -3,9 +3,14 @@
 Add, edit, remove and list products in your Google Sheet straight from Telegram.
 Works with the "Product Catalog Template" layout (products start at row 5, columns B–F).
 
+## Menu
+`/start` shows a persistent menu with **📋 Browse**, **🔍 Find**, **➕ Add** and **❓ Help** buttons,
+so day-to-day use rarely needs typing a command.
+
 ## Commands
 | Command | What it does |
 |---|---|
+| `/browse` | Tap through tabs → categories → paginated product lists, no typing needed |
 | `/find netflix` | Search all tabs by name (typo-tolerant) with Edit / Stock / Delete buttons on each result |
 | `/list` | Show products in the current tab |
 | `/add` | Guided flow: name → price → category → status → details |
