@@ -100,8 +100,25 @@ def remove_item(tab, n):
 
 
 def get_categories():
-    vals = book.worksheet("Lists").col_values(1)[1:31]
-    return [v for v in vals if v.strip()]
+    """Categories actually in use, taken from every tab's own product data (column D),
+    so the list always matches the real sheet instead of a separately maintained one.
+    Falls back to the Lists tab (if any) for categories not yet used on a product."""
+    seen, cats = set(), []
+    for tab in TABS:
+        for _, row in list_items(tab):
+            cat = str(row[2]).strip()
+            if cat and cat not in seen:
+                seen.add(cat)
+                cats.append(cat)
+    try:
+        for v in book.worksheet("Lists").col_values(1)[1:31]:
+            v = v.strip()
+            if v and v not in seen:
+                seen.add(v)
+                cats.append(v)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+    return cats
 
 
 MAX_RESULTS = 8
