@@ -5,10 +5,13 @@ Sheet layout expected on every product tab:
   A = No. (formula, never touched)  B = Name  C = Price  D = Category  E = Status  F = Details
 """
 import asyncio
+import base64
 import difflib
+import json
 import logging
 import os
 import re
+import tempfile
 import zlib
 from functools import wraps
 
@@ -534,7 +537,16 @@ def main():
         raise SystemExit("Set BOT_TOKEN and SHEET_ID in your .env file.")
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS is empty - nobody can use the bot yet. Send /myid to it, then add your ID to .env.")
-    book = gspread.service_account(filename=CREDS_FILE).open_by_key(SHEET_ID)
+    creds_b64 = os.environ.get("GOOGLE_CREDS_JSON", "")
+    if creds_b64:
+        # Railway/hosting friendly path: one base64 env var instead of a JSON file on disk.
+        data = base64.b64decode(creds_b64)
+        with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as f:
+            f.write(data)
+            creds_path = f.name
+    else:
+        creds_path = CREDS_FILE
+    book = gspread.service_account(filename=creds_path).open_by_key(SHEET_ID)
     have = {w.title for w in book.worksheets()}
     missing = [t for t in TABS + ["Lists"] if t not in have]
     if missing:
