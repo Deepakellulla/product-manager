@@ -17,6 +17,7 @@ import zlib
 from functools import wraps
 
 import gspread
+import requests
 from dotenv import load_dotenv
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -36,6 +37,7 @@ SHEET_ID = os.environ.get("SHEET_ID", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "service_account.json")
 TABS = [t.strip() for t in os.getenv("TABS", "All Products,Bundles,PC Games,Console Games").split(",") if t.strip()]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 FIRST_ROW, LAST_ROW = 5, 204
 MAX_ITEMS = LAST_ROW - FIRST_ROW + 1
@@ -101,6 +103,32 @@ def remove_item(tab, n):
     rows = [r for r in rows if _is_item(r)]           # close any gaps
     rows += [_blank() for _ in range(MAX_ITEMS - len(rows))]
     get_ws(tab).update(range_name=f"B{FIRST_ROW}:F{LAST_ROW}", values=rows, value_input_option="RAW")
+
+
+def bulk_add_items(tab, rows):
+    """Append many rows in a single write. Skips any whose name already exists in the tab
+    (case-insensitive), including duplicates within the same batch. Returns (added, skipped_names)."""
+    existing = {str(r[0]).strip().lower() for _, r in list_items(tab)}
+    to_add, skipped = [], []
+    for row in rows:
+        key = str(row[0]).strip().lower()
+        if not key or key in existing:
+            if key:
+                skipped.append(row[0])
+            continue
+        existing.add(key)
+        to_add.append(row)
+    if not to_add:
+        return 0, skipped
+    current = _get_rows(tab)
+    first_empty = next((i for i, r in enumerate(current) if not _is_item(r)), None)
+    room = MAX_ITEMS - first_empty if first_empty is not None else 0
+    if first_empty is None or len(to_add) > room:
+        raise RuntimeError(f"Not enough room in '{tab}' - only {max(room, 0)} slot(s) left, tried to add {len(to_add)}.")
+    start_row = FIRST_ROW + first_empty
+    end_row = start_row + len(to_add) - 1
+    get_ws(tab).update(range_name=f"B{start_row}:F{end_row}", values=to_add, value_input_option="RAW")
+    return len(to_add), skipped
 
 
 def get_categories(tab=None):
@@ -544,14 +572,17 @@ async def find_edit(update, context):
 
 
 # ───────────────────────── /add conversation ─────────────────────────
-NAME, PRICE, CATEGORY, STATUS, DETAILS, EDIT_FIELD, EDIT_CHOICE, EDIT_VALUE = range(8)
+(NAME, PRICE, CATEGORY, STATUS, DETAILS, REVIEW, REVIEW_FIELD, REVIEW_VALUE, REVIEW_PICK,
+ EDIT_FIELD, EDIT_CHOICE, EDIT_VALUE) = range(12)
 TXT = filters.TEXT & ~filters.COMMAND
 
 
 @admin_only
 async def add_start(update, context):
+    if update.callback_query:
+        await update.callback_query.answer()
     context.user_data["new"] = {}
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Adding to '{cur_tab(context)}'. Send /cancel to stop.\n\nProduct name?")
     return NAME
 
@@ -569,7 +600,7 @@ async def add_price(update, context):
         await update.message.reply_text("Please send the price as a number, e.g. 499")
         return PRICE
     context.user_data["new"]["price"] = price
-    cats = await asyncio.to_thread(get_categories)
+    cats = await asyncio.to_thread(get_categories, cur_tab(context))
     context.user_data["cats"] = cats
     await update.message.reply_text("Category?", reply_markup=keyboard(cats, "cat"))
     return CATEGORY
@@ -606,30 +637,272 @@ async def add_details_choice(update, context):
     idx = int(q.data.split(":")[1])
     opts = context.user_data.get("detail_opts", [])
     if idx < len(opts):
-        return await _save_new(update, context, opts[idx])
+        context.user_data["new"]["details"] = opts[idx]
+        return await _show_review(update, context)
     await q.edit_message_text("Type the details / delivery info:")
     return DETAILS
 
 
-async def _save_new(update, context, details):
-    new = context.user_data.pop("new")
-    tab = cur_tab(context)
-    row = [new["name"], new["price"], new["category"], new["status"], details]
-    try:
-        n = await asyncio.to_thread(add_item, tab, row)
-    except RuntimeError as e:
-        await update.effective_message.reply_text(str(e))
-        return ConversationHandler.END
-    await update.effective_message.reply_text(f"Added to '{tab}':\n\n{fmt_item(n, row)}")
-    return ConversationHandler.END
-
-
 async def add_details(update, context):
-    return await _save_new(update, context, update.message.text.strip())
+    context.user_data["new"]["details"] = update.message.text.strip()
+    return await _show_review(update, context)
 
 
 async def add_skip(update, context):
-    return await _save_new(update, context, "")
+    context.user_data["new"]["details"] = ""
+    return await _show_review(update, context)
+
+
+# ── review screen: confirm, fix a field, or cancel, before the sheet is touched ──
+REVIEW_KB = InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Confirm & Save", callback_data="rv:confirm"),
+    InlineKeyboardButton("✏️ Edit", callback_data="rv:edit"),
+    InlineKeyboardButton("❌ Cancel", callback_data="rv:cancel"),
+]])
+
+
+def _review_row(new):
+    return [new["name"], new["price"], new["category"], new["status"], new.get("details", "")]
+
+
+async def _show_review(update, context):
+    tab = cur_tab(context)
+    text = f"Add to '{tab}' - review before saving:\n\n{fmt_item('New', _review_row(context.user_data['new']))}"
+    await update.effective_message.reply_text(text, reply_markup=REVIEW_KB)
+    return REVIEW
+
+
+async def review_action(update, context):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":")[1]
+    if action == "cancel":
+        context.user_data.pop("new", None)
+        await q.edit_message_text("Cancelled - nothing was saved.")
+        return ConversationHandler.END
+    if action == "edit":
+        await q.edit_message_text("Which field do you want to change?", reply_markup=keyboard(FIELD_NAMES, "rf", 3))
+        return REVIEW_FIELD
+    # confirm
+    new = context.user_data.pop("new")
+    tab = cur_tab(context)
+    row = _review_row(new)
+    try:
+        n = await asyncio.to_thread(add_item, tab, row)
+    except RuntimeError as e:
+        await q.edit_message_text(str(e))
+        return ConversationHandler.END
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add another", callback_data="aa")]])
+    await q.edit_message_text(f"Added to '{tab}':\n\n{fmt_item(n, row)}", reply_markup=kb)
+    return ConversationHandler.END
+
+
+async def review_field(update, context):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":")[1])
+    context.user_data["review_idx"] = idx
+    if idx in (0, 1):
+        await q.edit_message_text(f"Send the new {FIELD_NAMES[idx].lower()}:")
+        return REVIEW_VALUE
+    if idx == 2:
+        cats = await asyncio.to_thread(get_categories, cur_tab(context))
+        context.user_data["cats"] = cats
+        await q.edit_message_text("New category?", reply_markup=keyboard(cats, "rc"))
+        return REVIEW_PICK
+    if idx == 3:
+        await q.edit_message_text("New status?", reply_markup=keyboard(STATUSES, "rs"))
+        return REVIEW_PICK
+    opts = await asyncio.to_thread(get_details_options, cur_tab(context))
+    context.user_data["detail_opts"] = opts
+    if opts:
+        await q.edit_message_text("New details?", reply_markup=keyboard(opts + ["✏️ Type my own"], "rd"))
+        return REVIEW_PICK
+    await q.edit_message_text("Send the new details:")
+    return REVIEW_VALUE
+
+
+async def review_value(update, context):
+    idx, text = context.user_data["review_idx"], update.message.text.strip()
+    if idx == 1:
+        try:
+            text = parse_price(text)
+        except ValueError:
+            await update.message.reply_text("Please send the price as a number, e.g. 499")
+            return REVIEW_VALUE
+    key = ["name", "price", "category", "status", "details"][idx]
+    context.user_data["new"][key] = text
+    return await _show_review(update, context)
+
+
+async def review_pick_category(update, context):
+    q = update.callback_query
+    await q.answer()
+    context.user_data["new"]["category"] = context.user_data["cats"][int(q.data.split(":")[1])]
+    return await _show_review(update, context)
+
+
+async def review_pick_status(update, context):
+    q = update.callback_query
+    await q.answer()
+    context.user_data["new"]["status"] = STATUSES[int(q.data.split(":")[1])]
+    return await _show_review(update, context)
+
+
+async def review_pick_details(update, context):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":")[1])
+    opts = context.user_data.get("detail_opts", [])
+    if idx < len(opts):
+        context.user_data["new"]["details"] = opts[idx]
+        return await _show_review(update, context)
+    await q.edit_message_text("Send the new details:")
+    return REVIEW_VALUE
+
+
+# ───────────────────────── screenshot import (Gemini vision, free tier) ─────────────────────────
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_PROMPT = (
+    "You are reading a screenshot of a spreadsheet that lists products for resale "
+    "(subscriptions, software, games, etc). Extract every product row you can clearly read. "
+    "Respond with ONLY a JSON array (no prose, no markdown fences), where each element is:\n"
+    '{"name": string, "price": number or null, "category": string, '
+    '"status": "In Stock" or "Out of Stock" or "", "details": string}\n'
+    "Use null/empty string for anything not visible or not legible. Do not invent data, "
+    "and do not include rows that are just column headers."
+)
+
+
+def extract_products_from_image(image_bytes, mime_type="image/jpeg"):
+    """Calls Gemini's free-tier vision API and returns a list of [name, price, category, status, details]
+    rows ready for bulk_add_items. Raises RuntimeError with a human-readable message on failure."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set - screenshot import isn't configured yet.")
+    body = {
+        "contents": [{"parts": [
+            {"text": GEMINI_PROMPT},
+            {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
+        ]}],
+        "generationConfig": {"response_mime_type": "application/json"},
+    }
+    try:
+        resp = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=60)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Couldn't reach Gemini: {e}") from e
+    if resp.status_code == 429:
+        raise RuntimeError("Gemini's free tier is rate-limited right now - wait a minute and send it again.")
+    if not resp.ok:
+        raise RuntimeError(f"Gemini returned an error ({resp.status_code}): {resp.text[:200]}")
+    try:
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        items = json.loads(text)
+    except (KeyError, IndexError, ValueError) as e:
+        raise RuntimeError(f"Couldn't understand Gemini's response: {e}") from e
+
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        if not name:
+            continue
+        price = it.get("price")
+        try:
+            price = parse_price(str(price)) if price not in (None, "") else ""
+        except ValueError:
+            price = ""
+        status = str(it.get("status") or "").strip()
+        if status not in STATUSES:
+            status = ""
+        rows.append([name, price, str(it.get("category") or "").strip(), status, str(it.get("details") or "").strip()])
+    return rows
+
+
+@admin_only
+async def import_start(update, context):
+    context.user_data["importing"] = True
+    context.user_data["import_items"] = []
+    context.user_data["import_tab"] = cur_tab(context)
+    await update.message.reply_text(
+        f"Bulk import into '{cur_tab(context)}' - send screenshots one at a time (or a few together).\n"
+        "When you're done, send /doneimport. To stop without adding anything, send /cancelimport.")
+
+
+@admin_only
+async def import_photo(update, context):
+    if not context.user_data.get("importing"):
+        await update.message.reply_text("Send /import first to start a bulk import from screenshots.")
+        return
+    photo = update.message.photo[-1]
+    status_msg = await update.message.reply_text("Reading this screenshot...")
+    tg_file = await context.bot.get_file(photo.file_id)
+    image_bytes = bytes(await tg_file.download_as_bytearray())
+    try:
+        rows = await asyncio.to_thread(extract_products_from_image, image_bytes)
+    except RuntimeError as e:
+        await status_msg.edit_text(f"Couldn't read that screenshot: {e}")
+        return
+    context.user_data["import_items"].extend(rows)
+    total = len(context.user_data["import_items"])
+    await status_msg.edit_text(
+        f"Found {len(rows)} product(s) in this screenshot (running total: {total}).\n"
+        "Send more screenshots, or /doneimport when finished.")
+
+
+@admin_only
+async def import_done(update, context):
+    items = context.user_data.get("import_items") or []
+    if not items:
+        await update.message.reply_text("No screenshots processed yet - send some photos first, or /cancelimport.")
+        return
+    tab = context.user_data.get("import_tab", cur_tab(context))
+    preview = "\n".join(f"{i + 1}. {r[0]} - {fmt_price(r[1]) if r[1] != '' else '?'}" for i, r in enumerate(items[:10]))
+    more = f"\n...and {len(items) - 10} more." if len(items) > 10 else ""
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Add all to sheet", callback_data="im:confirm"),
+                                InlineKeyboardButton("❌ Discard", callback_data="im:cancel")]])
+    await update.message.reply_text(
+        f"Ready to add {len(items)} product(s) to '{tab}':\n\n{preview}{more}\n\n"
+        "Products with a name matching one already in the sheet will be skipped automatically.",
+        reply_markup=kb)
+
+
+@admin_only
+async def import_cancel(update, context):
+    for k in ("importing", "import_items", "import_tab"):
+        context.user_data.pop(k, None)
+    await update.message.reply_text("Import cancelled - nothing was added.")
+
+
+@admin_only
+async def import_confirm_cb(update, context):
+    q = update.callback_query
+    await q.answer()
+    items = context.user_data.pop("import_items", [])
+    tab = context.user_data.pop("import_tab", cur_tab(context))
+    context.user_data.pop("importing", None)
+    if not items:
+        await q.edit_message_text("Nothing to add.")
+        return
+    try:
+        added, skipped = await asyncio.to_thread(bulk_add_items, tab, items)
+    except RuntimeError as e:
+        await q.edit_message_text(str(e))
+        return
+    msg = f"Added {added} product(s) to '{tab}'."
+    if skipped:
+        shown = ", ".join(skipped[:10]) + (f", +{len(skipped) - 10} more" if len(skipped) > 10 else "")
+        msg += f"\nSkipped {len(skipped)} already in the sheet: {shown}"
+    await q.edit_message_text(msg)
+
+
+@admin_only
+async def import_cancel_cb(update, context):
+    q = update.callback_query
+    await q.answer()
+    for k in ("importing", "import_items", "import_tab"):
+        context.user_data.pop(k, None)
+    await q.edit_message_text("Discarded - nothing was added.")
 
 
 # ───────────────────────── /edit conversation ─────────────────────────
@@ -709,7 +982,7 @@ async def edit_value(update, context):
 
 
 async def cancel(update, context):
-    for k in ("new", "edit_n", "edit_idx", "edit_tab", "choices", "cats"):
+    for k in ("new", "edit_n", "edit_idx", "edit_tab", "choices", "cats", "detail_opts", "review_idx"):
         context.user_data.pop(k, None)
     await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
@@ -728,6 +1001,7 @@ async def post_init(app):
         BotCommand("remove", "Delete a product"), BotCommand("tab", "Switch sheet tab"),
         BotCommand("cancel", "Cancel current action"), BotCommand("myid", "Show my Telegram ID"),
         BotCommand("browse", "Browse products by tab and category"),
+        BotCommand("import", "Bulk-add products from screenshots"),
     ])
 
 
@@ -758,6 +1032,7 @@ def main():
             CommandHandler("add", add_start),
             CommandHandler("edit", edit_start),
             MessageHandler(filters.Regex(r"^➕ Add$"), add_start),
+            CallbackQueryHandler(add_start, pattern=r"^aa$"),
             CallbackQueryHandler(find_edit, pattern=r"^fe:\d+:\d+:[0-9a-f]+$"),
         ],
         states={
@@ -767,6 +1042,14 @@ def main():
             STATUS: [CallbackQueryHandler(add_status, pattern=r"^stat:\d+$")],
             DETAILS: [CommandHandler("skip", add_skip), CallbackQueryHandler(add_details_choice, pattern=r"^dd:\d+$"),
                       MessageHandler(TXT, add_details)],
+            REVIEW: [CallbackQueryHandler(review_action, pattern=r"^rv:(confirm|edit|cancel)$")],
+            REVIEW_FIELD: [CallbackQueryHandler(review_field, pattern=r"^rf:\d$")],
+            REVIEW_VALUE: [MessageHandler(TXT, review_value)],
+            REVIEW_PICK: [
+                CallbackQueryHandler(review_pick_category, pattern=r"^rc:\d+$"),
+                CallbackQueryHandler(review_pick_status, pattern=r"^rs:\d+$"),
+                CallbackQueryHandler(review_pick_details, pattern=r"^rd:\d+$"),
+            ],
             EDIT_FIELD: [CallbackQueryHandler(edit_field, pattern=r"^ef:\d$")],
             EDIT_CHOICE: [CallbackQueryHandler(edit_choice, pattern=r"^ev:\d+$")],
             EDIT_VALUE: [MessageHandler(TXT, edit_value)],
@@ -779,6 +1062,12 @@ def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("browse", browse_cmd))
+    app.add_handler(CommandHandler("import", import_start))
+    app.add_handler(CommandHandler("doneimport", import_done))
+    app.add_handler(CommandHandler("cancelimport", import_cancel))
+    app.add_handler(MessageHandler(filters.PHOTO, import_photo))
+    app.add_handler(CallbackQueryHandler(import_confirm_cb, pattern=r"^im:confirm$"))
+    app.add_handler(CallbackQueryHandler(import_cancel_cb, pattern=r"^im:cancel$"))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("stock", stock_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
