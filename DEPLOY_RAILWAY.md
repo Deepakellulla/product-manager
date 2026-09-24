@@ -44,6 +44,7 @@ In Railway, open your service → **Variables** tab → add these:
 | `ADMIN_IDS` | your Telegram ID (get it from `/myid`, see step 6) |
 | `GOOGLE_CREDS_JSON` | the base64 string from step 3 |
 | `TABS` | `All Products,Bundles,PC Games,Console Games` (or your own tab names) |
+| `GEMINI_API_KEY` | (optional) free key from https://aistudio.google.com/apikey — enables `/import` |
 
 Leave `GOOGLE_CREDS_FILE` unset — the bot only needs it if you're not using
 `GOOGLE_CREDS_JSON`.
@@ -77,3 +78,8 @@ since it can change.
   redo step 6.
 - **PERMISSION_DENIED from Google:** the sheet isn't shared with the service
   account's `client_email` as Editor.
+- **Build fails with `No GitHub artifact attestations found for python@...`:** this is
+  Railway's build tool failing to verify that specific Python patch version, not a
+  problem with the bot. Remove `runtime.txt` from the repo (or delete its contents)
+  and redeploy — Railway will pick a working Python version on its own. If it still
+  fails, add a variable `MISE_PYTHON_GITHUB_ATTESTATIONS` set to `false` and redeploy.
