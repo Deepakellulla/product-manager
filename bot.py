@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import zlib
 from functools import wraps
 
@@ -787,12 +788,24 @@ def extract_products_from_image(image_bytes, mime_type="image/jpeg"):
         ]}],
         "generationConfig": {"response_mime_type": "application/json"},
     }
-    try:
-        resp = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=60)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Couldn't reach Gemini: {e}") from e
+    # Gemini sometimes returns temporary 500/503/504 ("high demand"); retry a few times before giving up.
+    delays = [0, 3, 8, 15]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=60)
+        except requests.RequestException as e:
+            if attempt < len(delays) - 1:
+                continue
+            raise RuntimeError(f"Couldn't reach Gemini: {e}") from e
+        if resp.status_code in (500, 503, 504) and attempt < len(delays) - 1:
+            continue
+        break
     if resp.status_code == 429:
         raise RuntimeError("Gemini's free tier is rate-limited right now - wait a minute and send it again.")
+    if resp.status_code in (500, 503, 504):
+        raise RuntimeError("Gemini is overloaded right now (its side, not yours) - please try again in a few minutes.")
     if not resp.ok:
         raise RuntimeError(f"Gemini returned an error ({resp.status_code}): {resp.text[:200]}")
     try:
