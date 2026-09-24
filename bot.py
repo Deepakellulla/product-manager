@@ -42,7 +42,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Models are tried in order; if one is overloaded (503) or gone (404) the next one is used.
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.7-flash").split(",") if m.strip()]
 
-FIRST_ROW, LAST_ROW = 5, 204
+FIRST_ROW = 5
+LAST_ROW = int(os.environ.get("LAST_ROW", "204"))  # last sheet row the bot may use; raise it after extending your sheet
 MAX_ITEMS = LAST_ROW - FIRST_ROW + 1
 COLS = "BCDEF"
 FIELD_NAMES = ["Name", "Price", "Category", "Status", "Details"]
