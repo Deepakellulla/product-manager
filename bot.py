@@ -38,6 +38,7 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "service_account.json")
 TABS = [t.strip() for t in os.getenv("TABS", "All Products,Bundles,PC Games,Console Games").split(",") if t.strip()]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 FIRST_ROW, LAST_ROW = 5, 204
 MAX_ITEMS = LAST_ROW - FIRST_ROW + 1
@@ -762,7 +763,7 @@ async def review_pick_details(update, context):
 
 
 # ───────────────────────── screenshot import (Gemini vision, free tier) ─────────────────────────
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 GEMINI_PROMPT = (
     "You are reading a screenshot of a spreadsheet that lists products for resale "
     "(subscriptions, software, games, etc). Extract every product row you can clearly read. "
