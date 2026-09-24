@@ -39,7 +39,8 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "service_account.json")
 TABS = [t.strip() for t in os.getenv("TABS", "All Products,Bundles,PC Games,Console Games").split(",") if t.strip()]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Models are tried in order; if one is overloaded (503) or gone (404) the next one is used.
+GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.7-flash").split(",") if m.strip()]
 
 FIRST_ROW, LAST_ROW = 5, 204
 MAX_ITEMS = LAST_ROW - FIRST_ROW + 1
@@ -764,7 +765,7 @@ async def review_pick_details(update, context):
 
 
 # ───────────────────────── screenshot import (Gemini vision, free tier) ─────────────────────────
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_PROMPT = (
     "You are reading a screenshot of a spreadsheet that lists products for resale "
     "(subscriptions, software, games, etc). Extract every product row you can clearly read. "
@@ -788,20 +789,29 @@ def extract_products_from_image(image_bytes, mime_type="image/jpeg"):
         ]}],
         "generationConfig": {"response_mime_type": "application/json"},
     }
-    # Gemini sometimes returns temporary 500/503/504 ("high demand"); retry a few times before giving up.
-    delays = [0, 3, 8, 15]
-    for attempt, delay in enumerate(delays):
-        if delay:
-            time.sleep(delay)
-        try:
-            resp = requests.post(GEMINI_URL, params={"key": GEMINI_API_KEY}, json=body, timeout=60)
-        except requests.RequestException as e:
-            if attempt < len(delays) - 1:
+    # Try each model in turn; retry once on temporary errors before moving to the next model.
+    resp = None
+    for model in GEMINI_MODELS:
+        for attempt in range(2):
+            if attempt:
+                time.sleep(3)
+            try:
+                resp = requests.post(f"{GEMINI_BASE}/{model}:generateContent", params={"key": GEMINI_API_KEY},
+                                     json=body, timeout=60)
+            except requests.RequestException as e:
+                log.warning("Gemini %s network error: %s", model, e)
+                resp = None
                 continue
-            raise RuntimeError(f"Couldn't reach Gemini: {e}") from e
-        if resp.status_code in (500, 503, 504) and attempt < len(delays) - 1:
-            continue
-        break
+            if resp.status_code in (500, 503, 504):
+                log.warning("Gemini %s returned %s, retrying/falling back", model, resp.status_code)
+                continue
+            break
+        if resp is not None and resp.status_code not in (404, 500, 503, 504):
+            break
+        if resp is not None and resp.status_code == 404:
+            log.warning("Gemini model %s not available (404), trying next", model)
+    if resp is None:
+        raise RuntimeError("Couldn't reach Gemini - check the server's internet connection and try again.")
     if resp.status_code == 429:
         raise RuntimeError("Gemini's free tier is rate-limited right now - wait a minute and send it again.")
     if resp.status_code in (500, 503, 504):
