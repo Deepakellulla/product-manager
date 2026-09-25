@@ -44,6 +44,8 @@ GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-3.6-
 
 FIRST_ROW = 5
 LAST_ROW = int(os.environ.get("LAST_ROW", "204"))  # last sheet row the bot may use; raise it after extending your sheet
+# Row height (px) applied to newly written rows so they visually match the template row (FIRST_ROW).
+ROW_HEIGHT = int(os.environ.get("ROW_HEIGHT", "28"))
 MAX_ITEMS = LAST_ROW - FIRST_ROW + 1
 COLS = "BCDEF"
 FIELD_NAMES = ["Name", "Price", "Category", "Status", "Details"]
@@ -93,6 +95,7 @@ def add_item(tab, values):
         if not _is_item(r):
             row = FIRST_ROW + i
             get_ws(tab).update(range_name=f"B{row}:F{row}", values=[values], value_input_option="RAW")
+            _apply_row_style(tab, row, row)
             return i + 1
     raise RuntimeError(f"This tab is full ({MAX_ITEMS} products).")
 
@@ -132,7 +135,45 @@ def bulk_add_items(tab, rows):
     start_row = FIRST_ROW + first_empty
     end_row = start_row + len(to_add) - 1
     get_ws(tab).update(range_name=f"B{start_row}:F{end_row}", values=to_add, value_input_option="RAW")
+    _apply_row_style(tab, start_row, end_row)
     return len(to_add), skipped
+
+
+def _apply_row_style(tab, start_row, end_row):
+    """Copy cell formatting, data validation (dropdowns) and row height from the template
+    row (FIRST_ROW) onto newly written rows, so every product the bot adds - via /add or
+    screenshot import - automatically matches the sheet's existing look. Best-effort: if this
+    fails (e.g. insufficient Sheets API scope), the product data itself is unaffected."""
+    try:
+        ws = get_ws(tab)
+        sheet_id = ws.id
+        src = {
+            "sheetId": sheet_id,
+            "startRowIndex": FIRST_ROW - 1,
+            "endRowIndex": FIRST_ROW,
+            "startColumnIndex": 0,
+            "endColumnIndex": 6,
+        }
+        dst = {
+            "sheetId": sheet_id,
+            "startRowIndex": start_row - 1,
+            "endRowIndex": end_row,
+            "startColumnIndex": 0,
+            "endColumnIndex": 6,
+        }
+        requests = [
+            {"copyPaste": {"source": src, "destination": dst, "pasteType": "PASTE_FORMAT"}},
+            {"copyPaste": {"source": src, "destination": dst, "pasteType": "PASTE_DATA_VALIDATION"}},
+            {"updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS",
+                          "startIndex": start_row - 1, "endIndex": end_row},
+                "properties": {"pixelSize": ROW_HEIGHT},
+                "fields": "pixelSize",
+            }},
+        ]
+        ws.spreadsheet.batch_update({"requests": requests})
+    except Exception as e:
+        log.warning("Couldn't copy row styling for %s rows %s-%s: %s", tab, start_row, end_row, e)
 
 
 def get_categories(tab=None):
